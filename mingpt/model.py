@@ -51,19 +51,32 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # e.g. [64, 11, 768]
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # e.g. [64, 11, 768] for q, k, v size before the following ops
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # e.g. [64, 12, 11, 64] for q, k, v size after the ops above
+        # 12 is due to the number of heads used by GPT2 demo
+        # note that because we are doing C // self.n_head, this essentially splits the embedding 768 into 12 chunks of 64 dim vector
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # this is formula 1 before softmax from "Attention Is All You Need" https://arxiv.org/pdf/1706.03762.pdf
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att size is [64, 12, 11, 11] because we are just doing [12, 11, 768] x [12, 768, 11] with batch 64
+        # this is done so that the model is not looking forward beyond T to see the answer it tries to predict
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att size is [64, 12, 11, 11] unchanged because we are just applying musks
+        # this is softmax part for formula 1
         att = F.softmax(att, dim=-1)
+        # att size is [64, 12, 11, 11] unchanged because we are just applying softmax
         att = self.attn_dropout(att)
+        # finally multiple v after softmax for formula 1
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # y is [64, 12, 11, 64] because we are doing [12, 11, 11] x [12, 11, 64] with batch 64
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -88,8 +101,12 @@ class Block(nn.Module):
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
     def forward(self, x):
+        # size unchanged [64, 11, 768]
+        # self.ln_1 and self.ln_2 are just layer norms
         x = x + self.attn(self.ln_1(x))
+        # size unchanged [64, 11, 768]
         x = x + self.mlpf(self.ln_2(x))
+        # size unchanged [64, 11, 768]
         return x
 
 class GPT(nn.Module):
@@ -141,6 +158,9 @@ class GPT(nn.Module):
                 'gpt-nano':     dict(n_layer=3, n_head=3, n_embd=48),
             }[config.model_type])
 
+        # nn.Embedding(num_embeddings, embedding_dim, ...)
+        # for wte, we are embedding the token so the number of embeddings == number of vocabs or tokens
+        # for wpe, because are embedding the position in the sequence, the number of embeddings == sequence size or block size
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -259,18 +279,32 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size() # b is batch size, t is number of subwords or block_size, e.g. [64, 11]
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
+        # 11 is self.block_size
+        # e.g. [64, 11, 768]
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # e.g. [1, 11, 768]
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        # e.g. [64, 11, 768]
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
+            # this part does not change the shape so it should always be e.g. [64, 11, 768]
             x = block(x)
+        # e.g. before x size [64, 11, 768]
+        # we have ln_f = nn.LayerNorm(config.n_embd) so this is just layer norm.
         x = self.transformer.ln_f(x)
+        # e.g. after x size [64, 11, 768]
         logits = self.lm_head(x)
+        # 3 is self.vocab_size
+        # e.g. logits size [64, 11, 3]
+        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # in this case, we reduce dimention from embedding 768 to vocab size 3 to
+        # produce probability for each vocab.
+        # The output vocab is 0, 1, and 2 for the run_demo.py
 
         # if we are given some desired targets also calculate the loss
         loss = None
